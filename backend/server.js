@@ -3,17 +3,33 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
-const { setupKinde, protectRoute } = require('@kinde-oss/kinde-node-express');
+const { setupKinde } = require('@kinde-oss/kinde-node-express');
+const connectDB = require('./src/config/database');
+const logger = require('./src/utils/logger');
+const { errorHandler } = require('./src/middleware/error');
+const userRoutes = require('./src/routes/user.routes');
+
 require('dotenv').config();
 
 const app = express();
 
-// Middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(cors());
+// Security Middleware
 app.use(helmet());
-app.use(morgan('dev'));
+app.use(cors({
+  origin: process.env.NODE_ENV === 'production' 
+    ? process.env.FRONTEND_URL 
+    : 'http://localhost:3001',
+  credentials: true
+}));
+
+// Body Parser
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+
+// Logging
+if (process.env.NODE_ENV === 'development') {
+  app.use(morgan('dev'));
+}
 
 // Kinde Auth Configuration
 const kindeConfig = {
@@ -22,7 +38,7 @@ const kindeConfig = {
   siteUrl: process.env.SITE_URL || 'http://localhost:5001',
   secret: process.env.KINDE_CLIENT_SECRET,
   redirectUrl: process.env.KINDE_REDIRECT_URL,
-  scope: 'openid profile email',
+  scope: 'openid profile email offline',
   grantType: 'AUTHORIZATION_CODE',
   unAuthorisedUrl: '/unauthorised',
   postLogoutRedirectUrl: process.env.KINDE_POST_LOGOUT_REDIRECT_URL
@@ -31,31 +47,62 @@ const kindeConfig = {
 setupKinde(kindeConfig, app);
 
 // Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch((err) => console.error('MongoDB connection error:', err));
+connectDB();
 
-// Routes
+// API Routes
+app.use('/api/users', userRoutes);
+
+// Health Check
 app.get('/api/health', (req, res) => {
-  res.status(200).json({ status: 'OK', message: 'Server is running' });
+  res.status(200).json({ 
+    status: 'success',
+    message: 'Server is healthy',
+    environment: process.env.NODE_ENV,
+    timestamp: new Date().toISOString()
+  });
 });
 
-// Protected route example
-app.get('/api/protected', protectRoute, (req, res) => {
-  res.json({ message: 'This is a protected route', user: req.user });
+// 404 Handler
+app.all('*', (req, res, next) => {
+  res.status(404).json({
+    status: 'error',
+    message: `Can't find ${req.originalUrl} on this server!`
+  });
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: 'Something went wrong!' });
+// Global Error Handler
+app.use(errorHandler);
+
+// Handle Uncaught Exceptions
+process.on('uncaughtException', err => {
+  logger.error('UNCAUGHT EXCEPTION! 💥 Shutting down...');
+  logger.error(err.name, err.message);
+  process.exit(1);
+});
+
+// Handle Unhandled Rejections
+process.on('unhandledRejection', err => {
+  logger.error('UNHANDLED REJECTION! 💥 Shutting down...');
+  logger.error(err.name, err.message);
+  server.close(() => {
+    process.exit(1);
+  });
+});
+
+// Handle SIGTERM
+process.on('SIGTERM', () => {
+  logger.info('👋 SIGTERM RECEIVED. Shutting down gracefully');
+  server.close(() => {
+    logger.info('💥 Process terminated!');
+  });
 });
 
 const PORT = process.env.PORT || 5001;
 
+let server;
 if (process.env.NODE_ENV !== 'lambda') {
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+  server = app.listen(PORT, () => {
+    logger.info(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
   });
 }
 
